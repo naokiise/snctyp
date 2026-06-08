@@ -431,7 +431,7 @@
       <a class="parent-link" href="https://naokiise.com/chaoscillator/">chaoscillator</a>
     </div>
     <div class="header-right">
-      <a href="https://info.naokiise.com/">About</a>
+      <a href="https://naokiise.com/info/">About</a>
       <button id="themeBtn" class="header-icon" title="Toggle theme">
         <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2"/><path d="M12 20v2"/><path d="m4.93 4.93 1.41 1.41"/><path d="m17.66 17.66 1.41 1.41"/><path d="M2 12h2"/><path d="M20 12h2"/><path d="m6.34 17.66-1.41 1.41"/><path d="m19.07 4.93-1.41 1.41"/></svg>
       </button>
@@ -471,6 +471,11 @@
       <label>Wave</label>
       <input type="range" id="waveSlider" min="0" max="100" value="50" aria-label="Wave Intensity" />
       <span class="slider-val" id="wave-val">50</span>
+    </div>
+    <div class="slider-group">
+      <label>Vol</label>
+      <input type="range" id="volumeSlider" min="0" max="100" value="80" aria-label="Volume" />
+      <span class="slider-val" id="volume-val">80</span>
     </div>
     <button id="fillToggle">Fill: OFF</button>
     <button id="fadeToggle" class="active">Fade: ON</button>
@@ -568,9 +573,70 @@
     let kerningEnabled = true;
     let sizeEnabled = false;
     let fadeEnabled = true;
-    const SOUND_MODES = ['OFF', 'ON'];
+    const SOUND_MODES = ['OFF', 'ON', 'MORSE'];
     let soundMode = 0;
     let soundEnabled = false;
+
+    const MORSE_CODE = {
+      'a':'.-','b':'-...','c':'-.-.','d':'-..','e':'.','f':'..-.','g':'--.','h':'....','i':'..','j':'.---',
+      'k':'-.-','l':'.-..','m':'--','n':'-.','o':'---','p':'.--.','q':'--.-','r':'.-.','s':'...','t':'-',
+      'u':'..-','v':'...-','w':'.--','x':'-..-','y':'-.--','z':'--..',
+      '0':'-----','1':'.----','2':'..---','3':'...--','4':'....-','5':'.....','6':'-....','7':'--...','8':'---..','9':'----.',
+      '.':'.-.-.-',',':'--..--','?':'..--..','!':'-.-.--','/':'-..-.','@':'.--.-.','=':'-...-',
+    };
+
+    let morseQueue = [];
+    let morseTimer = null;
+
+    function playMorseTone(type, onDone) {
+      const ctx = getDrumCtx();
+      if (!ctx) { onDone(); return; }
+      const t = ctx.currentTime;
+      const unitMs = Math.max(20, 1000 / (getSpeed() * 0.1));
+      const dur = type === 'dah' ? unitMs * 3 / 1000 : unitMs / 1000;
+      const freq = 680;
+      const osc = ctx.createOscillator();
+      const g = ctx.createGain();
+      osc.type = 'sine';
+      osc.frequency.value = freq;
+      g.gain.setValueAtTime(0, t);
+      g.gain.linearRampToValueAtTime(0.4, t + 0.005);
+      g.gain.setValueAtTime(0.4, t + dur - 0.005);
+      g.gain.linearRampToValueAtTime(0, t + dur);
+      osc.connect(g).connect(getDrumOutput());
+      osc.start(t); osc.stop(t + dur + 0.01);
+      autoCleanup(osc, g);
+      const unitMs_ = unitMs;
+      setTimeout(onDone, (dur + unitMs_ / 1000) * 1000);
+    }
+
+    function scheduleMorse(symbols) {
+      morseQueue.push(...symbols);
+      if (!morseTimer) processMorseQueue();
+    }
+
+    function processMorseQueue() {
+      morseTimer = null;
+      if (morseQueue.length === 0) return;
+      const sym = morseQueue.shift();
+      if (sym === 'gap') {
+        const gapMs = Math.max(60, 1000 / (getSpeed() * 0.1)) * 3;
+        morseTimer = setTimeout(processMorseQueue, gapMs);
+      } else {
+        playMorseTone(sym, () => { morseTimer = null; processMorseQueue(); });
+      }
+    }
+
+    function playMorse(ch) {
+      const code = MORSE_CODE[ch.toLowerCase()];
+      if (!code) return;
+      const symbols = [];
+      for (const c of code) {
+        symbols.push(c === '-' ? 'dah' : 'dit');
+      }
+      symbols.push('gap');
+      scheduleMorse(symbols);
+    }
     const FADE_DURATION = 3000;
 
     fillToggle.addEventListener('click', () => {
@@ -616,6 +682,9 @@
         const ctx = getDrumCtx();
         if (ctx.state === 'suspended') ctx.resume();
       }
+      morseQueue = [];
+      clearTimeout(morseTimer);
+      morseTimer = null;
       canvas.focus();
     });
 
@@ -654,6 +723,13 @@
 
     function pronounceChar(ch, reverse) {
       if (!soundEnabled) return;
+      if (soundMode === 2) {
+        const ctx = getDrumCtx();
+        if (ctx.state === 'suspended') ctx.resume();
+        playMorse(ch);
+        scheduleFrame();
+        return;
+      }
       const sf = getSpeedFactor();
       playDrum(ch.toLowerCase(), reverse, sf);
       scheduleFrame();
@@ -673,6 +749,12 @@
     let drumAudioEl = null;
     let drumAnalyser = null;
     let analyserData = null;
+    let masterGain = null;
+
+    function getVolume() {
+      const el = document.getElementById('volumeSlider');
+      return el ? parseInt(el.value) / 100 : 0.8;
+    }
 
     function getDrumCtx() {
       if (!drumCtx) {
@@ -681,9 +763,12 @@
         drumAnalyser.fftSize = 256;
         drumAnalyser.smoothingTimeConstant = 0.4;
         analyserData = new Uint8Array(drumAnalyser.frequencyBinCount);
+        masterGain = drumCtx.createGain();
+        masterGain.gain.value = getVolume();
         drumDest = drumCtx.createMediaStreamDestination();
-        drumAnalyser.connect(drumDest);
-        drumAnalyser.connect(drumCtx.destination);
+        drumAnalyser.connect(masterGain);
+        masterGain.connect(drumDest);
+        masterGain.connect(drumCtx.destination);
         drumAudioEl = new Audio();
         drumAudioEl.srcObject = drumDest.stream;
         drumAudioEl.play().catch(() => {});
@@ -1061,6 +1146,13 @@
       waveIntensity = parseInt(waveSlider.value);
       waveValEl.textContent = waveSlider.value;
       scheduleFrame();
+    });
+
+    const volumeSlider = document.getElementById('volumeSlider');
+    const volumeValEl = document.getElementById('volume-val');
+    volumeSlider.addEventListener('input', () => {
+      volumeValEl.textContent = volumeSlider.value;
+      if (masterGain) masterGain.gain.value = getVolume();
     });
 
     function resetBlink() {
@@ -1513,42 +1605,6 @@
       ctx.setLineDash([]);
       ctx.restore();
 
-      for (const pt of points) {
-        const w = wave(pt.x, pt.y);
-        const ew = e * wf;
-        if (pt.onCurve) {
-          const r = ON_CURVE_RADIUS + ew * 6;
-          ctx.beginPath();
-          ctx.arc(w.x, w.y, r, 0, Math.PI * 2);
-          ctx.fillStyle = 'rgba(' + fg + ',' + vertexAlpha.toFixed(3) + ')';
-          ctx.fill();
-          if (ew > 0.05) {
-            ctx.beginPath();
-            ctx.arc(w.x, w.y, r + ew * 10, 0, Math.PI * 2);
-            ctx.strokeStyle = 'rgba(' + fg + ', ' + (ew * 0.4 * vertexAlpha).toFixed(3) + ')';
-            ctx.lineWidth = 1;
-            ctx.stroke();
-          }
-        } else {
-          const r = OFF_CURVE_RADIUS + ew * 4;
-          ctx.beginPath();
-          ctx.arc(w.x, w.y, r, 0, Math.PI * 2);
-          ctx.strokeStyle = 'rgba(' + fg + ', ' + (Math.min(1, 0.5 + ew * 0.5) * vertexAlpha).toFixed(3) + ')';
-          ctx.lineWidth = 1 + ew * 1.5;
-          ctx.stroke();
-        }
-      }
-      }
-
-      if (vertexAlpha > 0.001) {
-      ctx.font = '9px system-ui, sans-serif';
-      ctx.textBaseline = 'middle';
-      for (const pt of points) {
-        const w = wave(pt.x, pt.y);
-        const la = pt.onCurve ? 0.6 : 0.35;
-        ctx.fillStyle = 'rgba(' + fg + ', ' + (la * vertexAlpha).toFixed(3) + ')';
-        ctx.fillText(String(pt.index), w.x + 6, w.y - 1);
-      }
       }
     }
 
@@ -2692,40 +2748,6 @@
             mCtx.stroke();
 
             const mVtxAlpha = fadeEnabled ? Math.max(0, 1 - fadeT) : 1;
-            if (mVtxAlpha > 0.001) {
-            const points = [];
-            for (let i = 0; i < vis; i++) {
-              const cmd = cmds[i];
-              if (cmd.type === 'Z') continue;
-              if (cmd.x1 !== undefined) points.push({ x: cmd.x1, y: cmd.y1, on: false });
-              if (cmd.x2 !== undefined) points.push({ x: cmd.x2, y: cmd.y2, on: false });
-              if (cmd.x !== undefined) points.push({ x: cmd.x, y: cmd.y, on: true });
-            }
-            for (const pt of points) {
-              const w = mw(pt.x, pt.y);
-              if (pt.on) {
-                const r = 2 + mew * 5;
-                mCtx.beginPath();
-                mCtx.arc(w.x, w.y, r, 0, Math.PI * 2);
-                mCtx.fillStyle = 'rgba(' + mFg + ',' + (0.8 * mVtxAlpha).toFixed(3) + ')';
-                mCtx.fill();
-                if (mew > 0.05) {
-                  mCtx.beginPath();
-                  mCtx.arc(w.x, w.y, r + mew * 8, 0, Math.PI * 2);
-                  mCtx.strokeStyle = 'rgba(' + mFg + ',' + (mew * 0.4 * mVtxAlpha).toFixed(3) + ')';
-                  mCtx.lineWidth = 0.8;
-                  mCtx.stroke();
-                }
-              } else {
-                const r = 1.5 + mew * 3;
-                mCtx.beginPath();
-                mCtx.arc(w.x, w.y, r, 0, Math.PI * 2);
-                mCtx.strokeStyle = 'rgba(' + mFg + ',' + (Math.min(1, 0.4 + mew * 0.5) * mVtxAlpha).toFixed(3) + ')';
-                mCtx.lineWidth = 0.8 + mew * 1.2;
-                mCtx.stroke();
-              }
-            }
-            }
 
             x += charW;
           }
@@ -3026,6 +3048,9 @@
           const ctx = getDrumCtx();
           if (ctx.state === 'suspended') ctx.resume();
         }
+        morseQueue = [];
+        clearTimeout(morseTimer);
+        morseTimer = null;
       });
       document.getElementById('mFill').addEventListener('click', () => {
         mShowFill = !mShowFill;
